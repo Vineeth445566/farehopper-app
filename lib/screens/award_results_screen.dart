@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../data/airports.dart';
 import '../models/award.dart';
 import '../services/award_service.dart';
 
@@ -109,6 +110,78 @@ class _AwardResultsScreenState extends State<AwardResultsScreen> {
     );
   }
 
+  /// Builds a PointsYeah deep link with the current search pre-filled.
+  /// PointsYeah is a free award search tool (no API key needed) — this
+  /// hands off to their live search in the browser.
+  Uri _pointsYeahUrl() {
+    final q = widget.query;
+    final cabins = q.cabins.isEmpty
+        ? AwardCabin.values
+        : q.cabins;
+    return Uri.https('www.pointsyeah.com', '/search', {
+      'departure': primaryAirport(q.from),
+      'arrival': primaryAirport(q.to),
+      'startDate': _fmtDate(q.startDate),
+      'endDate': _fmtDate(q.endDate),
+      'cabins': cabins.map((c) => c.name).join(','),
+      'trip': 'oneway',
+    });
+  }
+
+  String _fmtDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  Future<void> _openPointsYeah() async {
+    final uri = _pointsYeahUrl();
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('Could not open PointsYeah')),
+        );
+      }
+    }
+  }
+
+  Widget _buildLiveSearchBanner() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+            color: Colors.amber.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.bolt, color: Colors.amber),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Showing sample award data',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 2),
+                Text(
+                    'Tap below for live award availability '
+                    'on PointsYeah (free).',
+                    style: TextStyle(fontSize: 12)),
+              ],
+            ),
+          ),
+          FilledButton.tonal(
+            onPressed: _openPointsYeah,
+            child: const Text('Search live'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final q = widget.query;
@@ -137,16 +210,24 @@ class _AwardResultsScreenState extends State<AwardResultsScreen> {
           ? _buildLoading()
           : _visible.isEmpty
               ? _buildEmpty()
-              : RefreshIndicator(
-                  onRefresh: _runSearch,
-                  child: ListView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _visible.length,
-                    itemBuilder: (context, i) => _AwardCard(
-                      offer: _visible[i],
-                      onTap: () => _openDetail(_visible[i]),
+              : Column(
+                  children: [
+                    if (AwardServiceFactory.isMock)
+                      _buildLiveSearchBanner(),
+                    Expanded(
+                      child: RefreshIndicator(
+                        onRefresh: _runSearch,
+                        child: ListView.builder(
+                          padding: const EdgeInsets.all(12),
+                          itemCount: _visible.length,
+                          itemBuilder: (context, i) => _AwardCard(
+                            offer: _visible[i],
+                            onTap: () => _openDetail(_visible[i]),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
     );
   }
