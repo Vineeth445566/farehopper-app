@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../data/airports.dart';
 import '../models/flight.dart';
 import '../models/watch.dart';
 import '../services/flight_service.dart';
@@ -97,6 +99,37 @@ class _ResultsScreenState extends State<ResultsScreen> {
           'Price dropped to ${_fmtMoney(cheapest)} (was ${_fmtMoney(watch.lastSeenPrice!)}).';
     }
     await watchService.updateLastSeen(watch.id, cheapest);
+  }
+
+  /// Deep link into Google Flights with the current search pre-filled.
+  /// Google Flights has no public API; this hands off to their live
+  /// search in the browser.
+  Uri _googleFlightsUrl() {
+    final q = widget.query;
+    final from = primaryAirport(q.from);
+    final to = primaryAirport(q.to);
+    final date =
+        '${q.date.year}-${q.date.month.toString().padLeft(2, '0')}-${q.date.day.toString().padLeft(2, '0')}';
+    final trip = q.roundTrip ? 'round trip' : 'one way';
+    final query =
+        'Flights from $from to $to on $date $trip ${q.passengers} passenger${q.passengers == 1 ? '' : 's'}';
+    return Uri.https(
+        'www.google.com', '/travel/flights', {'q': query});
+  }
+
+  Future<void> _openGoogleFlights() async {
+    final uri = _googleFlightsUrl();
+    // url_launcher is already imported in this file (used for booking links).
+    if (!await launchUrl(uri,
+        mode: LaunchMode.externalApplication)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content:
+                  Text('Could not open Google Flights')),
+        );
+      }
+    }
   }
 
   Future<void> _watchRoute() async {
@@ -241,6 +274,11 @@ class _ResultsScreenState extends State<ResultsScreen> {
                 }
               },
             ),
+          ),
+          IconButton(
+            tooltip: 'Compare on Google Flights',
+            icon: const Icon(Icons.travel_explore),
+            onPressed: _openGoogleFlights,
           ),
           IconButton(
             tooltip: 'Watch this route',
