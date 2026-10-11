@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:math';
+
+import 'package:http/http.dart' as http;
 
 import '../config.dart';
 import '../data/airports.dart';
@@ -195,22 +198,45 @@ class ExploreDeal {
 
 /// Live provider backed by the Amadeus Flight Offers Search API.
 ///
-/// TODO: wire up when you have Amadeus Self-Service API credentials:
-///  1. POST https://test.api.amadeus.com/v1/security/oauth2/token
-///     with `grant_type=client_credentials`, `client_id`, `client_secret`
-///  2. GET https://test.api.amadeus.com/v2/shopping/flight-offers
-///     with query params `originLocationCode`, `destinationLocationCode`,
-///     `departureDate` (YYYY-MM-DD), adults, max results, `currencyCode=USD`.
-///     For metro codes, expand to member airports (see `expandMetro` in
-///     `lib/data/airports.dart`) and fan out one request per member.
-///  3. Map each offer's itineraries -> FlightSegment list, price.total ->
-///     totalPrice, and validatingAirlineCodes -> airline name.
-///  4. Cache the OAuth token until its expires_in elapses; refresh on 401.
+/// Auth: OAuth2 client credentials.
+///   POST https://test.api.amadeus.com/v1/security/oauth2/token
+///   body: grant_type=client_credentials&client_id=...&client_secret=...
+/// Search:
+///   GET https://test.api.amadeus.com/v2/shopping/flight-offers
+///     ?originLocationCode=PHX&destinationLocationCode=JFK
+///     &departureDate=2026-11-15&adults=1&max=20&currencyCode=USD
+///
+/// Metro codes (NYC, CHI, ...) are expanded to member airports and fanned
+/// out as one request per origin/destination pair; results are merged and
+/// sorted by price. The OAuth token is cached until shortly before expiry.
+///
+/// Note: the test environment serves cached/limited routes, not full live
+/// inventory. Switch [_host] to api.amadeus.com for production (metered).
 class AmadeusFlightService implements FlightService {
   final String apiKey;
   final String apiSecret;
 
+  static const _host = 'test.api.amadeus.com';
+  static const _maxResults = 20;
+
+  String? _token;
+  DateTime? _tokenExpiry;
+
   AmadeusFlightService({required this.apiKey, required this.apiSecret});
+
+  /// IATA carrier code -> display name for common US carriers.
+  static const _carrierNames = {
+    'AA': 'American',
+    'AS': 'Alaska',
+    'B6': 'JetBlue',
+    'DL': 'Delta',
+    'F9': 'Frontier',
+    'HA': 'Hawaiian',
+    'NK': 'Spirit',
+    'SY': 'Sun Country',
+    'UA': 'United',
+    'WN': 'Southwest',
+  };
 
   @override
   Future<List<FlightOffer>> search(SearchQuery query) async {
@@ -222,12 +248,175 @@ class AmadeusFlightService implements FlightService {
         'https://developers.amadeus.com/register',
       );
     }
-    // TODO: implement the OAuth2 token exchange + flight-offers call.
-    throw UnimplementedError(
-      'AmadeusFlightService.search is not implemented yet. '
-      'See the TODO in lib/services/flight_service.dart for the endpoint flow.',
-    );
+
+    final token = await _accessToken();
+    final origins = expandMetro(query.from);
+    final destinations = expandMetro(query.to);
+    final date = _fmtDate(query.date);
+
+    // Fan out across metro member airports (usually 1x1 or a few pairs).
+    final offers = <FlightOffer>[];
+    for (final o in origins) {
+      for (final d in destinations) {
+        if (o == d) continue;
+        offers.addAll(await _searchPair(
+          token: token,
+          origin: o,
+          destination: d,
+          date: date,
+          adults: query.passengers,
+          cabin: query.cabin,
+        ));
+      }
+    }
+    offers.sort((a, b) => a.totalPrice.compareTo(b.totalPrice));
+    return offers;
   }
+
+  Future<String> _accessToken() async {
+    if (_token != null &&
+        _tokenExpiry != null &&
+        DateTime.now().isBefore(
+            _tokenExpiry!.subtract(const Duration(minutes: 2)))) {
+      return _token!;
+    }
+    final resp = await http.post(
+      Uri.https(_host, '/v1/security/oauth2/token'),
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'grant_type=client_credentials'
+          '&client_id=${Uri.encodeComponent(apiKey)}'
+          '&client_secret=${Uri.encodeComponent(apiSecret)}',
+    );
+    if (resp.statusCode != 200) {
+      throw StateError(
+          'Amadeus auth failed: HTTP ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    _token = body['access_token'] as String;
+    final expiresIn = (body['expires_in'] as num?)?.toInt() ?? 1800;
+    _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
+    return _token!;
+  }
+
+  Future<List<FlightOffer>> _searchPair({
+    required String token,
+    required String origin,
+    required String destination,
+    required String date,
+    required int adults,
+    required CabinClass cabin,
+  }) async {
+    final uri = Uri.https(_host, '/v2/shopping/flight-offers', {
+      'originLocationCode': origin,
+      'destinationLocationCode': destination,
+      'departureDate': date,
+      'adults': adults.toString(),
+      'max': _maxResults.toString(),
+      'currencyCode': 'USD',
+    });
+    final resp = await http.get(
+      uri,
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (resp.statusCode != 200) {
+      // Amadeus returns 400 for routes with no availability in test env.
+      return [];
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final data = (body['data'] as List?) ?? [];
+    final dictionaries = body['dictionaries'] as Map<String, dynamic>?;
+    final carriers = (dictionaries?['carriers'] as Map?)?.cast<String, String>() ?? {};
+
+    final offers = <FlightOffer>[];
+    for (var i = 0; i < data.length; i++) {
+      final offer = _parseOffer(
+        Map<String, dynamic>.from(data[i] as Map),
+        index: i,
+        cabin: cabin,
+        carriers: carriers,
+      );
+      if (offer != null) offers.add(offer);
+    }
+    return offers;
+  }
+
+  FlightOffer? _parseOffer(
+    Map<String, dynamic> o, {
+    required int index,
+    required CabinClass cabin,
+    required Map<String, String> carriers,
+  }) {
+    try {
+      final itineraries = o['itineraries'] as List;
+      if (itineraries.isEmpty) return null;
+      final segs = (itineraries.first as Map)['segments'] as List;
+
+      final segments = <FlightSegment>[];
+      for (final s in segs) {
+        final sm = Map<String, dynamic>.from(s as Map);
+        final dep = sm['departure'] as Map;
+        final arr = sm['arrival'] as Map;
+        final carrierCode = (sm['carrierCode'] ?? '').toString();
+        final airline = _carrierNames[carrierCode] ??
+            carriers[carrierCode] ??
+            carrierCode;
+        segments.add(FlightSegment(
+          airline: airline,
+          flightNumber: '${sm['number'] ?? ''}',
+          from: (dep['iataCode'] ?? '').toString(),
+          to: (arr['iataCode'] ?? '').toString(),
+          departTime: DateTime.parse((dep['at'] ?? '').toString()),
+          arriveTime: DateTime.parse((arr['at'] ?? '').toString()),
+          duration: _parseDuration((sm['duration'] ?? '').toString()),
+        ));
+      }
+      if (segments.isEmpty) return null;
+
+      final price = (o['price'] as Map)['total']?.toString() ?? '0';
+      final total = double.tryParse(price) ?? 0;
+      if (total <= 0) return null;
+
+      final validating = (o['validatingAirlineCodes'] as List?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          [];
+      final airline = validating.isNotEmpty
+          ? (_carrierNames[validating.first] ??
+              carriers[validating.first] ??
+              validating.first)
+          : segments.first.airline;
+
+      final first = segments.first.departTime;
+      final last = segments.last.arriveTime;
+      return FlightOffer(
+        id: 'amadeus-$index-${o['id'] ?? ''}',
+        segments: segments,
+        totalPrice: total,
+        airline: airline,
+        stops: segments.length - 1,
+        totalDuration: last.difference(first),
+        bookingUrl:
+            'https://www.google.com/travel/flights', // Amadeus is search-only in test env
+        cabin: cabin,
+      );
+    } catch (_) {
+      return null; // skip malformed offers
+    }
+  }
+
+  /// Parses ISO-8601 durations like "PT2H30M".
+  Duration _parseDuration(String iso) {
+    final m = RegExp(r'PT(?:(\d+)H)?(?:(\d+)M)?').firstMatch(iso);
+    if (m == null) return Duration.zero;
+    final h = int.tryParse(m.group(1) ?? '0') ?? 0;
+    final min = int.tryParse(m.group(2) ?? '0') ?? 0;
+    return Duration(hours: h, minutes: min);
+  }
+
+  String _fmtDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
 }
 
 /// Picks the live provider when credentials exist, else the mock.
