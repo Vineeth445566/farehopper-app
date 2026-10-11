@@ -419,9 +419,220 @@ class AmadeusFlightService implements FlightService {
       '${d.day.toString().padLeft(2, '0')}';
 }
 
+/// Live provider backed by the Duffel API (free searches).
+///
+/// Docs: https://duffel.com/docs/api
+/// Auth: `Authorization: Bearer <token>` + `Duffel-Version: v2`
+/// Flow:
+///   1. POST /air/offer_requests { data: { slices: [...], passengers: [...] } }
+///   2. GET /air/offers?offer_request_id={id}&limit=20
+///
+/// Note: test tokens (duffel_test_...) return Duffel Airways sample data.
+/// A live token (after "going live" in the Duffel dashboard) returns real
+/// bookable offers from 300+ airlines.
+class DuffelFlightService implements FlightService {
+  final String apiToken;
+
+  static const _host = 'api.duffel.com';
+
+  DuffelFlightService({required this.apiToken});
+
+  Map<String, String> get _headers => {
+        'Authorization': 'Bearer $apiToken',
+        'Duffel-Version': 'v2',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      };
+
+  @override
+  Future<List<FlightOffer>> search(SearchQuery query) async {
+    if (apiToken.isEmpty) {
+      throw UnimplementedError(
+        'DuffelFlightService needs an API token. '
+        'Get a free one at https://duffel.com and pass it with '
+        '--dart-define=DUFFEL_API_KEY=... (see lib/config.dart).',
+      );
+    }
+
+    final origins = expandMetro(query.from);
+    final destinations = expandMetro(query.to);
+    final date = _fmtDate(query.date);
+
+    final offers = <FlightOffer>[];
+    for (final o in origins) {
+      for (final d in destinations) {
+        if (o == d) continue;
+        offers.addAll(await _searchPair(
+          origin: o,
+          destination: d,
+          date: date,
+          adults: query.passengers,
+          cabin: query.cabin,
+        ));
+      }
+    }
+    offers.sort((a, b) => a.totalPrice.compareTo(b.totalPrice));
+    return offers;
+  }
+
+  Future<List<FlightOffer>> _searchPair({
+    required String origin,
+    required String destination,
+    required String date,
+    required int adults,
+    required CabinClass cabin,
+  }) async {
+    // 1. Create the offer request.
+    final reqResp = await http.post(
+      Uri.https(_host, '/air/offer_requests'),
+      headers: _headers,
+      body: jsonEncode({
+        'data': {
+          'slices': [
+            {
+              'origin': origin,
+              'destination': destination,
+              'departure_date': date,
+            }
+          ],
+          'passengers': List.generate(
+              adults, (_) => {'type': 'adult'}),
+          'max_connections': 2,
+          'cabin_class': _duffelCabin(cabin),
+        }
+      }),
+    );
+    if (reqResp.statusCode != 200 && reqResp.statusCode != 201) {
+      return [];
+    }
+    final reqBody =
+        jsonDecode(reqResp.body) as Map<String, dynamic>;
+    final requestId =
+        ((reqBody['data'] as Map)['id'] ?? '').toString();
+    if (requestId.isEmpty) return [];
+
+    // 2. Fetch the offers.
+    final offersResp = await http.get(
+      Uri.https(_host, '/air/offers',
+          {'offer_request_id': requestId, 'limit': '20'}),
+      headers: _headers,
+    );
+    if (offersResp.statusCode != 200) return [];
+    final offersBody =
+        jsonDecode(offersResp.body) as Map<String, dynamic>;
+    final data = (offersBody['data'] as List?) ?? [];
+
+    final offers = <FlightOffer>[];
+    for (var i = 0; i < data.length; i++) {
+      final offer = _parseOffer(
+        Map<String, dynamic>.from(data[i] as Map),
+        cabin: cabin,
+      );
+      if (offer != null) offers.add(offer);
+    }
+    return offers;
+  }
+
+  String _duffelCabin(CabinClass cabin) {
+    switch (cabin) {
+      case CabinClass.economy:
+        return 'economy';
+      case CabinClass.premium:
+        return 'premium_economy';
+      case CabinClass.business:
+        return 'business';
+    }
+  }
+
+  FlightOffer? _parseOffer(
+    Map<String, dynamic> o, {
+    required CabinClass cabin,
+  }) {
+    try {
+      final slices = o['slices'] as List;
+      if (slices.isEmpty) return null;
+      final segments =
+          ((slices.first as Map)['segments'] as List);
+
+      final flightSegments = <FlightSegment>[];
+      for (final s in segments) {
+        final sm = Map<String, dynamic>.from(s as Map);
+        final origin =
+            (sm['origin'] as Map?)?['iata_code']?.toString() ?? '';
+        final dest =
+            (sm['destination'] as Map?)?['iata_code']?.toString() ??
+                '';
+        final carrier = (sm['operating_carrier'] as Map?) ??
+            (sm['marketing_carrier'] as Map?);
+        final airline =
+            carrier?['name']?.toString() ?? 'Unknown';
+        flightSegments.add(FlightSegment(
+          airline: airline,
+          flightNumber:
+              (sm['marketing_carrier_flight_number'] ?? '')
+                  .toString(),
+          from: origin,
+          to: dest,
+          departTime:
+              DateTime.parse((sm['departing_at'] ?? '').toString())
+                  .toLocal(),
+          arriveTime:
+              DateTime.parse((sm['arriving_at'] ?? '').toString())
+                  .toLocal(),
+          duration: _parseDuration(
+              (sm['duration'] ?? '').toString()),
+        ));
+      }
+      if (flightSegments.isEmpty) return null;
+
+      final total =
+          double.tryParse((o['total_amount'] ?? '0').toString()) ??
+              0;
+      if (total <= 0) return null;
+
+      final owner = o['owner'] as Map?;
+      final airline =
+          owner?['name']?.toString() ??
+              flightSegments.first.airline;
+
+      final first = flightSegments.first.departTime;
+      final last = flightSegments.last.arriveTime;
+      return FlightOffer(
+        id: 'duffel-${o['id'] ?? ''}',
+        segments: flightSegments,
+        totalPrice: total,
+        airline: airline,
+        stops: flightSegments.length - 1,
+        totalDuration: last.difference(first),
+        bookingUrl: 'https://www.google.com/travel/flights',
+        cabin: cabin,
+      );
+    } catch (_) {
+      return null; // skip malformed offers
+    }
+  }
+
+  Duration _parseDuration(String iso) {
+    final m = RegExp(r'PT(?:(\d+)H)?(?:(\d+)M)?').firstMatch(iso);
+    if (m == null) return Duration.zero;
+    final h = int.tryParse(m.group(1) ?? '0') ?? 0;
+    final min = int.tryParse(m.group(2) ?? '0') ?? 0;
+    return Duration(hours: h, minutes: min);
+  }
+
+  String _fmtDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+}
+
 /// Picks the live provider when credentials exist, else the mock.
+/// Duffel is preferred over Amadeus (Amadeus self-service is discontinued).
 class FlightServiceFactory {
   static FlightService create() {
+    if (AppConfig.duffelApiKey.isNotEmpty) {
+      return DuffelFlightService(apiToken: AppConfig.duffelApiKey);
+    }
     if (AppConfig.amadeusApiKey.isNotEmpty &&
         AppConfig.amadeusApiSecret.isNotEmpty) {
       return AmadeusFlightService(
@@ -431,4 +642,8 @@ class FlightServiceFactory {
     }
     return MockFlightService();
   }
+
+  /// True when showing sample data instead of live prices.
+  static bool get isMock => AppConfig.duffelApiKey.isEmpty &&
+      AppConfig.amadeusApiKey.isEmpty;
 }

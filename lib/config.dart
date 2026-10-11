@@ -20,4 +20,12 @@ class AppConfig {
     'SEATS_AERO_API_KEY',
     defaultValue: '',
   );
+
+  /// Duffel API token for live flight search.
+  /// Free at https://duffel.com — pass with
+  /// --dart-define=DUFFEL_API_KEY=duffel_test_...
+  static const String duffelApiKey = String.fromEnvironment(
+    'DUFFEL_API_KEY',
+    defaultValue: '',
+  );
 }
