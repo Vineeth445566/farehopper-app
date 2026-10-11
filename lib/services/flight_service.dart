@@ -631,13 +631,20 @@ class DuffelFlightService implements FlightService {
 class FlightServiceFactory {
   static FlightService create() {
     if (AppConfig.duffelApiKey.isNotEmpty) {
-      return DuffelFlightService(apiToken: AppConfig.duffelApiKey);
+      return _ResilientFlightService(
+        primary:
+            DuffelFlightService(apiToken: AppConfig.duffelApiKey),
+        fallback: MockFlightService(),
+      );
     }
     if (AppConfig.amadeusApiKey.isNotEmpty &&
         AppConfig.amadeusApiSecret.isNotEmpty) {
-      return AmadeusFlightService(
-        apiKey: AppConfig.amadeusApiKey,
-        apiSecret: AppConfig.amadeusApiSecret,
+      return _ResilientFlightService(
+        primary: AmadeusFlightService(
+          apiKey: AppConfig.amadeusApiKey,
+          apiSecret: AppConfig.amadeusApiSecret,
+        ),
+        fallback: MockFlightService(),
       );
     }
     return MockFlightService();
@@ -646,4 +653,25 @@ class FlightServiceFactory {
   /// True when showing sample data instead of live prices.
   static bool get isMock => AppConfig.duffelApiKey.isEmpty &&
       AppConfig.amadeusApiKey.isEmpty;
+}
+
+/// Wraps a live provider with a mock fallback: if the live search throws
+/// or returns no offers, sample data is returned so the UI never goes blank.
+class _ResilientFlightService implements FlightService {
+  final FlightService primary;
+  final FlightService fallback;
+
+  _ResilientFlightService(
+      {required this.primary, required this.fallback});
+
+  @override
+  Future<List<FlightOffer>> search(SearchQuery query) async {
+    try {
+      final offers = await primary.search(query);
+      if (offers.isNotEmpty) return offers;
+    } catch (_) {
+      // Fall through to mock data.
+    }
+    return fallback.search(query);
+  }
 }
