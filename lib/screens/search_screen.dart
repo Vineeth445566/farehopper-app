@@ -15,6 +15,7 @@ class _AirportField extends StatefulWidget {
   final AirportOption? exclude;
 
   const _AirportField({
+    super.key,
     required this.label,
     required this.value,
     required this.onChanged,
@@ -29,6 +30,30 @@ class _AirportFieldState extends State<_AirportField> {
   late final TextEditingController _controller;
 
   String _display(AirportOption? v) => v == null ? '' : v.city;
+
+  /// Best-effort match for whatever the user typed, used when they hit
+  /// search without tapping a suggestion. Exact code > code prefix >
+  /// city prefix > any substring match.
+  AirportOption? resolveTypedText() {
+    final q = _controller.text.trim().toLowerCase();
+    if (q.isEmpty) return null;
+    final options = airportOptions
+        .where((a) => a.code != widget.exclude?.code)
+        .toList();
+    AirportOption? firstWhere(bool Function(AirportOption) test) {
+      for (final a in options) {
+        if (test(a)) return a;
+      }
+      return null;
+    }
+    return firstWhere((a) => a.code.toLowerCase() == q) ??
+        firstWhere((a) => a.code.toLowerCase().startsWith(q)) ??
+        firstWhere((a) => a.city.toLowerCase().startsWith(q)) ??
+        firstWhere((a) =>
+            a.code.toLowerCase().contains(q) ||
+            a.city.toLowerCase().contains(q) ||
+            a.subtitle.toLowerCase().contains(q));
+  }
 
   @override
   void initState() {
@@ -129,6 +154,8 @@ class SearchScreen extends StatefulWidget {
 }
 
 class _SearchScreenState extends State<SearchScreen> {
+  final _fromKey = GlobalKey<_AirportFieldState>();
+  final _toKey = GlobalKey<_AirportFieldState>();
   AirportOption? _from = airportOptions
       .firstWhere((o) => o.code == 'PHX', orElse: () => airportOptions.first);
   AirportOption? _to;
@@ -157,16 +184,22 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   SearchQuery? _buildQuery() {
-    if (_from == null || _to == null) {
+    // If the user typed text but never tapped a suggestion, resolve it now.
+    final from = _from ?? _fromKey.currentState?.resolveTypedText();
+    final to = _to ?? _toKey.currentState?.resolveTypedText();
+    if (from == null || to == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
             content: Text('Select both a departure and arrival airport.')),
       );
       return null;
     }
+    // Lock in the resolved values so the fields display correctly.
+    if (from != _from) setState(() => _from = from);
+    if (to != _to) setState(() => _to = to);
     return SearchQuery(
-      from: _from!.code,
-      to: _to!.code,
+      from: from.code,
+      to: to.code,
       date: _date,
       passengers: _passengers,
       roundTrip: _roundTrip,
@@ -183,17 +216,19 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   void _explore() {
-    if (_from == null) {
+    final from = _from ?? _fromKey.currentState?.resolveTypedText();
+    if (from == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
             content: Text('Pick an origin airport to explore from.')),
       );
       return;
     }
+    if (from != _from) setState(() => _from = from);
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ExploreScreen(
-          origin: _from!.code,
+          origin: from.code,
           date: _date,
           cabin: _cabin,
         ),
@@ -249,6 +284,7 @@ class _SearchScreenState extends State<SearchScreen> {
               children: [
                 Expanded(
                   child: _AirportField(
+                    key: _fromKey,
                     label: 'From',
                     value: _from,
                     exclude: _to,
@@ -262,6 +298,7 @@ class _SearchScreenState extends State<SearchScreen> {
                 ),
                 Expanded(
                   child: _AirportField(
+                    key: _toKey,
                     label: 'To',
                     value: _to,
                     exclude: _from,
